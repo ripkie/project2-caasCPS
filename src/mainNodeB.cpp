@@ -57,9 +57,7 @@ void motorStop()
   digitalWrite(IN2_PIN, LOW);
 }
 
-// =========================
 // LCD SCREENS
-// =========================
 void lcdShowEmergency()
 {
   lcd.clear();
