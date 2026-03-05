@@ -31,7 +31,7 @@ void loop()
     {
       stableState = reading;
 
-      // trigger hanya saat jadi HIGH (baru ditekan)
+      // trigger
       if (stableState == HIGH)
       {
         Serial.println("EMERGENCY BUTTON PRESSED");
