@@ -1,41 +1,26 @@
 #include <Arduino.h>
 #include <Wire.h>
-
 #define BUTTON_PIN 4
 
-int lastReading = LOW;
-int stableState = LOW;
-unsigned long lastDebounceMs = 0;
-const unsigned long debounceMs = 30;
+int lastButtonState = LOW;
 
 void setup()
 {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT);
-  Serial.println("Node A Ready (debounce)");
+  Serial.println("Node A Ready");
 }
 
 void loop()
 {
-  int reading = digitalRead(BUTTON_PIN);
+  int buttonState = digitalRead(BUTTON_PIN);
 
-  if (reading != lastReading)
+  // trigger
+  if (buttonState == HIGH && lastButtonState == LOW)
   {
-    lastDebounceMs = millis();
-    lastReading = reading;
+    Serial.println("EMERGENCY BUTTON PRESSED");
   }
 
-  if (millis() - lastDebounceMs > debounceMs)
-  {
-    if (reading != stableState)
-    {
-      stableState = reading;
-
-      // trigger
-      if (stableState == HIGH)
-      {
-        Serial.println("EMERGENCY BUTTON PRESSED");
-      }
-    }
-  }
+  lastButtonState = buttonState;
+  delay(10);
 }
