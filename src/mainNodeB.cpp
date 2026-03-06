@@ -29,12 +29,16 @@ const int PWM_RES = 8;
 // =========================
 // STATE
 // =========================
-volatile int pwmValue = 150;
+volatile int pwmValue = 150; // kecepatan pwm
 
+// Emergency hanya dari NodeA
 volatile bool espNowEmergency = false;
-volatile bool webEmergency = false;
 volatile bool emergencyStop = false;
 
+// web tidak lagi jadi sumber emergency
+volatile bool cancelRequestFlag = false;
+
+// IR interrupt
 volatile bool irTriggered = false;
 volatile unsigned long lastIrIsrMs = 0;
 
@@ -51,7 +55,7 @@ int lastShownPwm = -1;
 // =========================
 const unsigned long COUNT_LOCKOUT_MS = 50;
 
-const unsigned long SEND_INTERVAL = 1500; // POST ke Railway tiap 1.5 detik
+const unsigned long SEND_INTERVAL = 1500; // POST tiap 1.5 detik
 unsigned long lastSendMs = 0;
 
 const unsigned long CONTROL_CHECK_INTERVAL = 1000; // GET control tiap 1 detik
@@ -68,8 +72,13 @@ typedef struct __attribute__((packed))
   uint8_t emergency;
 } EspNowMsg;
 
+// function prototype
+void updateEmergencyState();
+void applyControl();
+void sendToRailway();
+
 // =========================
-// IR INTERRUPT
+// INTERRUPT IR
 // =========================
 void IRAM_ATTR onIrDetected()
 {
@@ -115,9 +124,9 @@ void lcdShowRunTemplate()
 {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Count: 0");
+  lcd.print("Count: ");
   lcd.setCursor(0, 1);
-  lcd.print("PWM: 150");
+  lcd.print("PWM: ");
 
   lastShownCounter = 0xFFFFFFFF;
   lastShownPwm = -1;
@@ -170,15 +179,15 @@ void lcdShowWifiStatus(bool connected)
 // =========================
 // HELPER PARSE
 // =========================
-bool parseEmergencyFromResponse(const String &response)
+bool parseCancelFromResponse(const String &response)
 {
-  if (response.indexOf("\"emergency\":1") >= 0)
+  if (response.indexOf("\"cancel\":1") >= 0)
     return true;
-  if (response.indexOf("\"emergency\": 1") >= 0)
+  if (response.indexOf("\"cancel\": 1") >= 0)
     return true;
-  if (response.indexOf("\"emergency\":true") >= 0)
+  if (response.indexOf("\"cancel\":true") >= 0)
     return true;
-  if (response.indexOf("\"emergency\": true") >= 0)
+  if (response.indexOf("\"cancel\": true") >= 0)
     return true;
   return false;
 }
@@ -217,6 +226,7 @@ int parsePwmFromResponse(const String &response, int defaultValue)
 // =========================
 // ESP-NOW CALLBACK
 // =========================
+// Pakai signature lama supaya kompatibel
 void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
   if (len != sizeof(EspNowMsg))
@@ -255,12 +265,12 @@ void sendToRailway()
   jsonData += "}";
 
   int httpCode = http.POST(jsonData);
+  Serial.printf("Railway POST -> %d\n", httpCode);
 
   if (httpCode > 0)
   {
     String response = http.getString();
-    Serial.printf("Railway POST OK: %d\n", httpCode);
-    Serial.printf("POST response: %s\n", response.substring(0, 100).c_str());
+    Serial.printf("POST response: %s\n", response.substring(0, 80).c_str());
   }
   else
   {
@@ -288,36 +298,53 @@ void checkWebControl()
   String response = "";
 
   if (httpCode > 0)
-  {
     response = http.getString();
-  }
-  else
-  {
-    Serial.printf("Control GET fail: %d -> %s\n",
-                  httpCode,
-                  http.errorToString(httpCode).c_str());
-  }
 
   http.end();
 
+  Serial.printf("Control GET -> %d | %s\n", httpCode, response.substring(0, 80).c_str());
+
   if (httpCode == 200)
   {
-    webEmergency = parseEmergencyFromResponse(response);
+    bool changed = false;
+
+    bool cancelRequest = parseCancelFromResponse(response);
+
+    if (cancelRequest && espNowEmergency)
+    {
+      espNowEmergency = false;
+      emergencyStop = false; // update langsung
+      Serial.println("Emergency canceled from web");
+      changed = true;
+    }
 
     int newPwm = parsePwmFromResponse(response, pwmValue);
     if (newPwm >= 0 && newPwm <= 255)
     {
-      pwmValue = newPwm;
+      if (abs(newPwm - pwmValue) > 2)
+      {
+        pwmValue = newPwm;
+        Serial.printf("WEB PWM -> %d\n", pwmValue);
+        changed = true;
+      }
+    }
+
+    // kalau ada perubahan, kirim update ke dashboard secepatnya
+    if (changed)
+    {
+      updateEmergencyState();
+      applyControl();
+      sendToRailway();
+      lastSendMs = millis();
     }
   }
 }
-
 // =========================
 // SYSTEM CONTROL
 // =========================
 void updateEmergencyState()
 {
-  emergencyStop = (espNowEmergency || webEmergency);
+  emergencyStop = espNowEmergency;
 }
 
 void applyControl()
@@ -325,9 +352,12 @@ void applyControl()
   updateEmergencyState();
 
   if (emergencyStop)
+  {
     motorStop();
-  else
-    motorForward(pwmValue);
+    return;
+  }
+
+  motorForward(pwmValue);
 }
 
 // =========================
@@ -357,7 +387,6 @@ void ensureWiFi()
 
   if (millis() - lastReconnectAttempt < 3000)
     return;
-
   lastReconnectAttempt = millis();
 
   Serial.println("WiFi disconnected, reconnecting...");
@@ -371,7 +400,7 @@ void ensureWiFi()
 void setup()
 {
   Serial.begin(115200);
-  delay(500);
+  delay(1000);
 
   Serial.println("=== NODEB STARTUP ===");
 
@@ -379,11 +408,11 @@ void setup()
   pinMode(IN1_PIN, OUTPUT);
   pinMode(IN2_PIN, OUTPUT);
 
-  // PWM
+  // PWM setup
   ledcSetup(PWM_CH, PWM_FREQ, PWM_RES);
   ledcAttachPin(ENA_PIN, PWM_CH);
 
-  // LCD
+  // LCD setup
   Wire.begin(SDA_PIN, SCL_PIN);
   lcd.init();
   lcd.backlight();
@@ -396,16 +425,16 @@ void setup()
   Serial.println(WiFi.macAddress());
 
   lcdShowMacAddress();
-  delay(1200);
+  delay(1500);
 
   // Connect WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("Connecting WiFi '%s'", WIFI_SSID);
 
   int wifiAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20)
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 30)
   {
-    delay(400);
+    delay(500);
     Serial.print(".");
     wifiAttempts++;
   }
@@ -429,16 +458,16 @@ void setup()
     lcdShowWifiStatus(false);
   }
 
-  delay(1200);
+  delay(1500);
 
-  // Samakan channel ESP-NOW dengan WiFi
+  // Penting: samakan channel ESP-NOW dengan channel WiFi
   if (wifiConnected)
   {
     esp_wifi_set_channel(WiFi.channel(), WIFI_SECOND_CHAN_NONE);
     Serial.printf("ESP-NOW set to channel %d\n", WiFi.channel());
   }
 
-  // ESP-NOW
+  // ESP-NOW init
   if (esp_now_init() != ESP_OK)
   {
     Serial.println("ESP-NOW init FAILED!");
@@ -452,12 +481,10 @@ void setup()
   esp_now_register_recv_cb(onEspNowRecv);
   Serial.println("ESP-NOW Ready");
 
-  // IR interrupt
   attachInterrupt(digitalPinToInterrupt(IR_PIN), onIrDetected, FALLING);
 
-  // Start motor
   motorForward(pwmValue);
-  delay(300);
+  delay(500);
 
   lcdShowRunTemplate();
   lcdUpdateRunValues(true);
@@ -472,7 +499,7 @@ void setup()
 void loop()
 {
   ensureWiFi();
-  applyControl();
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
 
   // proses hasil interrupt IR
   if (irTriggered)
@@ -482,17 +509,26 @@ void loop()
     interrupts();
 
     counter++;
+    Serial.printf("COUNT #%lu\n", counter);
   }
 
-  // update LCD saat emergency berubah
+  // BACA CONTROL WEB LEBIH DULU
+  if (millis() - lastControlCheck >= CONTROL_CHECK_INTERVAL)
+  {
+    lastControlCheck = millis();
+    checkWebControl();
+  }
+
+  // Baru apply state terbaru
+  applyControl();
+
+  // Update LCD saat emergency berubah
   if (emergencyStop != lastEmergencyStop)
   {
     lastEmergencyStop = emergencyStop;
 
     if (emergencyStop)
-    {
       lcdShowEmergency();
-    }
     else
     {
       lcdShowRunTemplate();
@@ -500,24 +536,19 @@ void loop()
     }
   }
 
-  // POST ke Railway tiap 1.5 detik
+  // Send Railway periodik
   if (millis() - lastSendMs >= SEND_INTERVAL)
   {
     lastSendMs = millis();
     sendToRailway();
   }
 
-  // GET control tiap 1 detik
-  if (millis() - lastControlCheck >= CONTROL_CHECK_INTERVAL)
-  {
-    lastControlCheck = millis();
-    checkWebControl();
-  }
-
-  // refresh LCD ringan
+  // LCD refresh
   if (!emergencyStop && millis() - lastLcdMs >= LCD_INTERVAL)
   {
     lastLcdMs = millis();
     lcdUpdateRunValues();
   }
+
+  delay(10);
 }
