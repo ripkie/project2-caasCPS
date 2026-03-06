@@ -1,35 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <ArduinoWebsockets.h>
 
-using namespace websockets;
-
-// =========================
-// WIFI + RAILWAY WS
-// =========================
-const char *ssid = "iPhone";
-const char *password = "12341234";
-
-// contoh: "wss://nama-project.up.railway.app"
-const char *WS_URL = "wss://esp32-websocket.up.railway.app";
-
-// client websocket
-WebsocketsClient wsClient;
-bool wsConnected = false;
-unsigned long lastWsReconnectMs = 0;
-const unsigned long WS_RECONNECT_INTERVAL = 3000;
-
-// kirim status berkala ke server
-unsigned long lastStatusSendMs = 0;
-const unsigned long STATUS_INTERVAL = 400;
-
-// =========================
-// PIN CONFIG
-// =========================
 #define IR_PIN 2
+
 #define SDA_PIN 9
 #define SCL_PIN 8
 
@@ -39,24 +16,22 @@ const unsigned long STATUS_INTERVAL = 400;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// PWM
 const int PWM_CH = 0;
 const int PWM_FREQ = 20000;
 const int PWM_RES = 8;
-volatile int pwmValue = 150; // kecepatan motorrrrrr
+volatile int pwmValue = 150; // kecepatan motor
 
-// COUNTER
 uint32_t counter = 0;
 int lastIR = HIGH;
 
+// anti double count (sesuaikan speed conveyor)
 const unsigned long COUNT_LOCKOUT_MS = 80;
 unsigned long lastCountMs = 0;
 
-// LCD refresh
+// LCD refresh normal
 const unsigned long LCD_INTERVAL = 200;
 unsigned long lastLcdMs = 0;
 
-// ESP-NOW payload
 typedef struct __attribute__((packed))
 {
   uint8_t emergency;
@@ -66,9 +41,7 @@ typedef struct __attribute__((packed))
 volatile bool emergencyStop = false;
 bool lastEmergencyStop = false;
 
-// =========================
-// MOTOR CONTROL
-// =========================
+// kontrol motor
 void motorForward(int pwm)
 {
   pwm = constrain(pwm, 0, 255);
@@ -84,9 +57,7 @@ void motorStop()
   digitalWrite(IN2_PIN, LOW);
 }
 
-// =========================
-// LCD
-// =========================
+// LCD SCREENS
 void lcdShowEmergency()
 {
   lcd.clear();
@@ -105,6 +76,7 @@ void lcdShowRunTemplate()
   lcd.print("PWM: ");
 }
 
+// update angka tanpa clear terus
 void lcdUpdateRunValues()
 {
   lcd.setCursor(7, 0);
@@ -116,10 +88,8 @@ void lcdUpdateRunValues()
   lcd.print("     ");
 }
 
-// =========================
-// ESP-NOW CALLBACK
-// jangan sentuh LCD di callback
-// =========================
+// ESP-NOW RECEIVE CALLBACK
+// NOTE: jangan utak-atik LCD di sini (biar gak corrupt)
 void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
   if (len != sizeof(EspNowMsg))
@@ -142,161 +112,35 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len)
   }
 }
 
-// =========================
-// PARSE MESSAGE dari Railway
-// format yang didukung:
-// 1) "PWM:150"
-// 2) JSON sederhana: {"type":"pwm","value":150}
-// =========================
-int parsePwmFromMessage(const String &msg)
-{
-  if (msg.startsWith("PWM:"))
-  {
-    return msg.substring(4).toInt();
-  }
-
-  // parse JSON simpel tanpa ArduinoJson
-  // cari "value":
-  int idx = msg.indexOf("\"value\"");
-  if (idx >= 0)
-  {
-    int colon = msg.indexOf(':', idx);
-    if (colon >= 0)
-    {
-      String num = msg.substring(colon + 1);
-      num.replace("}", "");
-      num.replace(" ", "");
-      num.replace("\"", "");
-      return num.toInt();
-    }
-  }
-  return -1;
-}
-
-// =========================
-// KIRIM STATUS ke Railway
-// =========================
-void sendStatusToServer()
-{
-  // JSON status (dashboard baca ini untuk indikator RUN/EMERGENCY)
-  String out = "{";
-  out += "\"type\":\"status\",";
-  out += "\"count\":" + String(counter) + ",";
-  out += "\"pwm\":" + String((int)pwmValue) + ",";
-  out += "\"emergency\":" + String(emergencyStop ? 1 : 0);
-  out += "}";
-
-  wsClient.send(out);
-}
-
-// =========================
-// CONNECT WS
-// =========================
-void connectWebsocket()
-{
-  if (wsConnected)
-    return;
-
-  Serial.println("WS: connecting to Railway...");
-
-  // supaya gampang (tanpa CA cert). Untuk produksi lebih aman pakai sertifikat.
-  wsClient.setInsecure();
-
-  wsClient.onEvent([](WebsocketsEvent event, String data)
-                   {
-                     if (event == WebsocketsEvent::ConnectionOpened)
-                     {
-                       wsConnected = true;
-                       Serial.println("WS: connected");
-                     }
-                     else if (event == WebsocketsEvent::ConnectionClosed)
-                     {
-                       wsConnected = false;
-                       Serial.println("WS: disconnected");
-                     }
-                     else if (event == WebsocketsEvent::GotPing)
-                     {
-                       // optional
-                     }
-                     else if (event == WebsocketsEvent::GotPong)
-                     {
-                       // optional
-                     } });
-
-  wsClient.onMessage([](WebsocketsMessage message)
-                     {
-                       String msg = message.data();
-                       msg.trim();
-
-                       Serial.print("WS RX: ");
-                       Serial.println(msg);
-
-                       int v = parsePwmFromMessage(msg);
-                       if (v >= 0 && v <= 255)
-                       {
-                         pwmValue = v;
-
-                         // safety priority: kalau emergency, PWM disimpan tapi motor tetap stop
-                         if (!emergencyStop)
-                           motorForward(pwmValue);
-
-                         Serial.print("PWM set via WS = ");
-                         Serial.println((int)pwmValue);
-                       } });
-
-  bool ok = wsClient.connect(WS_URL);
-  if (!ok)
-  {
-    wsConnected = false;
-    Serial.println("WS: connect FAILED");
-  }
-}
-
-// =========================
 // SETUP
-// =========================
 void setup()
 {
   Serial.begin(115200);
-  delay(300);
+  delay(800);
 
   // IR
   pinMode(IR_PIN, INPUT_PULLUP);
 
-  // motor pins
+  // Motor pins
   pinMode(IN1_PIN, OUTPUT);
   pinMode(IN2_PIN, OUTPUT);
 
+  // PWM init
   ledcSetup(PWM_CH, PWM_FREQ, PWM_RES);
   ledcAttachPin(ENA_PIN, PWM_CH);
 
-  // LCD
+  // LCD init
   Wire.begin(SDA_PIN, SCL_PIN);
   lcd.init();
   lcd.backlight();
 
-  // ===== WiFi connect (butuh internet untuk Railway) =====
+  // WiFi + ESP-NOW
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(400);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.println("WiFi connected!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  int ch = WiFi.channel();
-  Serial.print("WiFi Channel: ");
-  Serial.println(ch);
   Serial.print("NodeB MAC: ");
   Serial.println(WiFi.macAddress());
 
-  // ===== ESP-NOW init (pakai channel WiFi router) =====
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
   if (esp_now_init() != ESP_OK)
   {
     Serial.println("ESP-NOW init FAILED!");
@@ -306,67 +150,45 @@ void setup()
     while (true)
       delay(100);
   }
-  esp_now_register_recv_cb(onEspNowRecv);
-  Serial.println("ESP-NOW Ready");
 
-  // start motor
+  esp_now_register_recv_cb(onEspNowRecv);
+  Serial.println("NodeB Ready (ESP-NOW receiver)");
+
+  // Start in RUN mode
   motorForward(pwmValue);
   lcdShowRunTemplate();
   lcdUpdateRunValues();
 
-  // connect websocket
-  connectWebsocket();
-
-  Serial.println("READY: ESP-NOW + Railway WS + IR + LCD + PWM");
-  Serial.println("NOTE: NodeA channel harus sama dengan WiFi Channel di atas!");
+  Serial.println("Ready: IR Count + PWM + LCD + ESP-NOW");
 }
 
-// =========================
 // LOOP
-// =========================
 void loop()
 {
-  // poll websocket
-  wsClient.poll();
-
-  // reconnect WS jika putus
-  if (!wsConnected && (millis() - lastWsReconnectMs >= WS_RECONNECT_INTERVAL))
-  {
-    lastWsReconnectMs = millis();
-    connectWebsocket();
-  }
-
-  // kirim status berkala (RUN/EMERGENCY + count + pwm)
-  if (wsConnected && (millis() - lastStatusSendMs >= STATUS_INTERVAL))
-  {
-    lastStatusSendMs = millis();
-    sendStatusToServer();
-  }
-
-  // update LCD saat mode berubah
   if (emergencyStop != lastEmergencyStop)
   {
     lastEmergencyStop = emergencyStop;
 
     if (emergencyStop)
+    {
       lcdShowEmergency();
+    }
     else
     {
       lcdShowRunTemplate();
       lcdUpdateRunValues();
-      motorForward(pwmValue);
     }
   }
 
-  // safety priority
   if (emergencyStop)
   {
-    delay(10);
+    delay(20);
     return;
   }
 
-  // IR counting (edge detect + lockout)
+  // ---- IR counting (edge detect + lockout) ----
   int irNow = digitalRead(IR_PIN);
+
   if (lastIR == HIGH && irNow == LOW)
   {
     unsigned long now = millis();
@@ -380,7 +202,7 @@ void loop()
   }
   lastIR = irNow;
 
-  // LCD periodic update
+  // ---- LCD update (periodic, no clear) ----
   if (millis() - lastLcdMs >= LCD_INTERVAL)
   {
     lastLcdMs = millis();
