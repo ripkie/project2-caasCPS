@@ -5,10 +5,11 @@
 
 #define BUTTON_PIN 4
 
-// GANTI sesuai MAC NodeB
+// GANTI dengan MAC NodeB yang tampil di Serial / LCD
 uint8_t receiverMac[] = {0xDC, 0xB4, 0xD9, 0x1B, 0xB3, 0x18};
 
-// Samakan dengan channel WiFi NodeB
+// Samakan dengan channel WiFi hotspot NodeB
+// Cek dari Serial NodeB: "WiFi channel: X"
 #define ESPNOW_CHANNEL 6
 
 typedef struct __attribute__((packed))
@@ -16,21 +17,8 @@ typedef struct __attribute__((packed))
   uint8_t emergency;
 } EspNowMsg;
 
-volatile bool buttonIrqFlag = false;
-volatile unsigned long buttonIrqMs = 0;
-
+int lastButtonState = HIGH; // karena INPUT_PULLUP
 bool emergencyState = false;
-const unsigned long BUTTON_DEBOUNCE_MS = 120;
-
-void IRAM_ATTR onButtonPressed()
-{
-  unsigned long now = millis();
-  if (now - buttonIrqMs >= BUTTON_DEBOUNCE_MS)
-  {
-    buttonIrqMs = now;
-    buttonIrqFlag = true;
-  }
-}
 
 void onSend(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
@@ -59,12 +47,14 @@ void sendEmergency(uint8_t emg)
 void setup()
 {
   Serial.begin(115200);
-  delay(300);
+  delay(800);
 
+  // Tombol ke GND
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA);
-  delay(50);
+  delay(100);
+
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   Serial.print("NodeA MAC: ");
@@ -93,25 +83,27 @@ void setup()
       delay(100);
   }
 
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPressed, FALLING);
-
-  Serial.println("NodeA Ready");
-  Serial.println("Push button interrupt active");
+  Serial.println("NodeA Ready (ESP-NOW sender)");
+  Serial.println("Press button to toggle emergency");
 }
 
 void loop()
 {
-  if (buttonIrqFlag)
-  {
-    noInterrupts();
-    buttonIrqFlag = false;
-    interrupts();
+  int buttonState = digitalRead(BUTTON_PIN);
 
+  // Tombol ditekan: HIGH -> LOW
+  if (buttonState == LOW && lastButtonState == HIGH)
+  {
     emergencyState = !emergencyState;
 
     Serial.print("BUTTON -> toggle, emergencyState=");
     Serial.println(emergencyState ? "1 (STOP)" : "0 (RUN)");
 
     sendEmergency(emergencyState ? 1 : 0);
+
+    delay(200); // debounce sederhana
   }
+
+  lastButtonState = buttonState;
+  delay(10);
 }
