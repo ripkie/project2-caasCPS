@@ -5,16 +5,32 @@
 
 #define BUTTON_PIN 4
 
-// MAC nodeB
+// GANTI sesuai MAC NodeB
 uint8_t receiverMac[] = {0xDC, 0xB4, 0xD9, 0x1B, 0xB3, 0x18};
+
+// Samakan dengan channel WiFi NodeB
+#define ESPNOW_CHANNEL 6
 
 typedef struct __attribute__((packed))
 {
   uint8_t emergency;
 } EspNowMsg;
 
-int lastButtonState = LOW;
+volatile bool buttonIrqFlag = false;
+volatile unsigned long buttonIrqMs = 0;
+
 bool emergencyState = false;
+const unsigned long BUTTON_DEBOUNCE_MS = 120;
+
+void IRAM_ATTR onButtonPressed()
+{
+  unsigned long now = millis();
+  if (now - buttonIrqMs >= BUTTON_DEBOUNCE_MS)
+  {
+    buttonIrqMs = now;
+    buttonIrqFlag = true;
+  }
+}
 
 void onSend(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
@@ -43,15 +59,18 @@ void sendEmergency(uint8_t emg)
 void setup()
 {
   Serial.begin(115200);
-  delay(800);
+  delay(300);
 
-  pinMode(BUTTON_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  delay(50);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   Serial.print("NodeA MAC: ");
   Serial.println(WiFi.macAddress());
+  Serial.print("ESP-NOW channel: ");
+  Serial.println(ESPNOW_CHANNEL);
 
   if (esp_now_init() != ESP_OK)
   {
@@ -64,7 +83,7 @@ void setup()
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, receiverMac, 6);
-  peerInfo.channel = 1;
+  peerInfo.channel = ESPNOW_CHANNEL;
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK)
@@ -74,26 +93,25 @@ void setup()
       delay(100);
   }
 
-  Serial.println("Node A Ready (ESP-NOW sender)");
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPressed, FALLING);
+
+  Serial.println("NodeA Ready");
+  Serial.println("Push button interrupt active");
 }
 
 void loop()
 {
-  int buttonState = digitalRead(BUTTON_PIN);
-
-  // trigger saat baru ditekan (LOW -> HIGH)
-  if (buttonState == HIGH && lastButtonState == LOW)
+  if (buttonIrqFlag)
   {
+    noInterrupts();
+    buttonIrqFlag = false;
+    interrupts();
+
     emergencyState = !emergencyState;
 
     Serial.print("BUTTON -> toggle, emergencyState=");
     Serial.println(emergencyState ? "1 (STOP)" : "0 (RUN)");
 
     sendEmergency(emergencyState ? 1 : 0);
-
-    delay(200); // delay debounce biar ga double2 pencetnya
   }
-
-  lastButtonState = buttonState;
-  delay(10);
 }
